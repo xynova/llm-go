@@ -1189,7 +1189,6 @@ func TestStreamRejectsMalformedProtocol(t *testing.T) {
 		{name: "missing finish reason", contentType: "text/event-stream", body: "data: {\"choices\":[{\"index\":0,\"delta\":{}}]}\n\n", want: "no finish reason"},
 		{name: "tool delta", contentType: "text/event-stream", body: "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{}]},\"finish_reason\":null}]}\n\n", want: "streamed tool call"},
 		{name: "done before finish", contentType: "text/event-stream", body: "data: [DONE]\n\n", want: "before a finish reason"},
-		{name: "missing done", contentType: "text/event-stream", body: "data: " + validFinish + "\n\n", want: "without [DONE]"},
 		{name: "unterminated done", contentType: "text/event-stream", body: "data: " + validFinish + "\n\ndata: [DONE]", want: "without [DONE]"},
 		{name: "discard incomplete EOF event", contentType: "text/event-stream", body: "data: " + validFinish + "\n\ndata: {", want: "without [DONE]"},
 		{name: "altered done marker", contentType: "text/event-stream", body: "data: " + validFinish + "\n\ndata: [DONE] \n\n", want: "decode event"},
@@ -1199,13 +1198,6 @@ func TestStreamRejectsMalformedProtocol(t *testing.T) {
 			body: "data: {\"id\":\"one\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\n" +
 				"data: {\"id\":\"two\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
 			want: "ID changed",
-		},
-		{
-			name:        "choice after finish",
-			contentType: "text/event-stream",
-			body: "data: " + validFinish + "\n\n" +
-				"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":null}]}\n\n",
-			want: "after the finish reason",
 		},
 		{
 			name:        "incomplete usage",
@@ -1247,6 +1239,79 @@ func TestStreamRejectsMalformedProtocol(t *testing.T) {
 			requireModelError(t, terminal, llm.KindMalformedResponse, "stream")
 			if !strings.Contains(terminal.Error(), test.want) {
 				t.Fatalf("Recv() error = %q, want substring %q", terminal, test.want)
+			}
+			_ = stream.Close()
+		})
+	}
+}
+
+func TestStream_TrailingChoiceAfterFinish(t *testing.T) {
+	contentEvent := `{"id":"chat","model":"model","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}`
+	finishEvent := `{"id":"chat","model":"model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`
+	contentThenFinish := "data: " + contentEvent + "\n\n" + "data: " + finishEvent
+
+	tests := []struct {
+		name       string
+		body       string
+		wantText   string
+		wantFinish llm.FinishReason
+	}{
+		{
+			name: "empty delta after finish",
+			body: contentThenFinish + "\n\n" +
+				"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n" +
+				"data: [DONE]\n\n",
+			wantText:   "hello",
+			wantFinish: llm.FinishReasonStop,
+		},
+		{
+			name: "text delta after finish",
+			body: contentThenFinish + "\n\n" +
+				"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":null}]}\n\n" +
+				"data: [DONE]\n\n",
+			wantText:   "hellolate",
+			wantFinish: llm.FinishReasonStop,
+		},
+		{
+			name: "second finish only",
+			body: contentThenFinish + "\n\n" +
+				"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+				"data: [DONE]\n\n",
+			wantText:   "hello",
+			wantFinish: llm.FinishReasonStop,
+		},
+		{
+			name: "missing done after finish",
+			body: contentThenFinish + "\n\n" +
+				"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+			wantText:   "hello",
+			wantFinish: llm.FinishReasonStop,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := newStaticStreamClient(t, []llm.Capability{llm.CapabilityStreaming}, http.StatusOK, "text/event-stream", test.body)
+			stream, err := client.Stream(context.Background(), llm.Request{Messages: []llm.Message{{Role: llm.RoleUser}}})
+			if err != nil {
+				t.Fatalf("Stream() error = %v", err)
+			}
+			chunks, terminal := receiveAll(stream)
+			if !errors.Is(terminal, io.EOF) {
+				t.Fatalf("Recv() terminal = %v, want io.EOF", terminal)
+			}
+			var text strings.Builder
+			var finish llm.FinishReason
+			for _, chunk := range chunks {
+				for _, part := range chunk.Content {
+					text.WriteString(part.Text)
+				}
+				if chunk.FinishReason != "" {
+					finish = chunk.FinishReason
+				}
+			}
+			if text.String() != test.wantText || finish != test.wantFinish {
+				t.Fatalf("assembled output = (%q, %q), want (%q, %q)", text.String(), finish, test.wantText, test.wantFinish)
 			}
 			_ = stream.Close()
 		})

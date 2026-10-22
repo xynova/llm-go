@@ -270,6 +270,12 @@ func readEventStream(ctx context.Context, body io.Reader, decoder *streamDecoder
 		}
 		return streamTransportError("read event stream: %w", err)
 	}
+	if hasData {
+		return malformedStream("event stream ended without [DONE]")
+	}
+	if decoder.finished {
+		return nil
+	}
 	return malformedStream("event stream ended without [DONE]")
 }
 
@@ -439,7 +445,7 @@ func (d *streamDecoder) consume(data string, emit internalstream.Emit) (bool, er
 		return false, malformedStream("event contains %d choices, want exactly one", len(choices))
 	}
 	if d.finished {
-		return false, malformedStream("event contains a choice after the finish reason")
+		return d.consumeChoiceAfterFinish(choices[0], usage, emit)
 	}
 
 	choice := choices[0]
@@ -551,6 +557,59 @@ func (d *streamDecoder) consume(data string, emit internalstream.Emit) (bool, er
 
 	if len(chunk.Content) != 0 || len(chunk.ToolCalls) != 0 || chunk.FinishReason != "" ||
 		len(chunk.ProviderData) != 0 || chunk.Usage != nil || len(chunk.Events) != 0 {
+		if !emit(chunk) {
+			return false, errStreamEmitStopped
+		}
+	}
+	return false, nil
+}
+
+func (d *streamDecoder) consumeChoiceAfterFinish(choice streamChoice, usage *llm.Usage, emit internalstream.Emit) (bool, error) {
+	if choice.Index != nil && *choice.Index != 0 {
+		return false, malformedStream("event choice has index %d, want 0", *choice.Index)
+	}
+	if choice.Delta == nil {
+		return false, nil
+	}
+	delta := choice.Delta
+	if delta.Role != nil && *delta.Role != string(llm.RoleAssistant) {
+		return false, malformedStream("event delta has role %q, want assistant", *delta.Role)
+	}
+	if len(choice.FinishReason) != 0 {
+		_, _, hasFinish, err := decodeStreamFinishReason(choice.FinishReason)
+		if err != nil {
+			return false, err
+		}
+		if hasFinish {
+			return false, nil
+		}
+	}
+	if len(delta.ToolCalls) != 0 || delta.FunctionCall != nil {
+		return false, nil
+	}
+	if delta.Refusal != nil && *delta.Refusal != "" {
+		return false, nil
+	}
+	if delta.ReasoningContent != nil || delta.Reasoning != nil || delta.ReasoningDetails != nil {
+		return false, nil
+	}
+
+	chunk := llm.Chunk{ID: d.id, Model: d.modelForChunk(true)}
+	if delta.Content != nil && *delta.Content != "" {
+		if err := d.buffer(&d.content, *delta.Content); err != nil {
+			return false, err
+		}
+		chunk.Content = []llm.Part{{Text: *delta.Content}}
+		chunk.Events = append(chunk.Events, llm.StreamEvent{Kind: llm.StreamEventTextDelta, Index: 0, Delta: *delta.Content})
+	}
+	if usage != nil {
+		if d.usageSeen {
+			return false, malformedStream("event stream contains repeated usage")
+		}
+		d.usageSeen = true
+		chunk.Usage = usage
+	}
+	if len(chunk.Content) != 0 || chunk.Usage != nil {
 		if !emit(chunk) {
 			return false, errStreamEmitStopped
 		}
